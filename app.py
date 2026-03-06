@@ -1,97 +1,103 @@
 import modal
 import os
 import json
+import pandas as pd
 from datetime import datetime
 
-# 1. Configuración del entorno (Añadimos librerías para el análisis)
+# Configuración de la imagen con Streamlit y modelos de IA
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "faster-whisper", 
-        "torch", 
-        "torchaudio",
-        "transformers" # Para el análisis de texto
+        "faster-whisper", "torch", "transformers", 
+        "streamlit", "pandas", "plotly"
     )
     .apt_install("ffmpeg")
 )
 
 volume = modal.Volume.from_name("resultados-analisis-audio", create_if_missing=True)
-app = modal.App("transcriptor-analista-v1", image=image)
+app = modal.App("dashboard-callcenter", image=image)
 
-@app.cls(
-    gpu="T4", 
-    container_idle_timeout=60, 
-    volumes={"/data": volume}
-)
+# --- CLASE PROCESADORA (GPU) ---
+@app.cls(gpu="T4", volumes={"/data": volume})
 class CallAnalyst:
     @modal.enter()
     def setup(self):
         from faster_whisper import WhisperModel
         from transformers import pipeline
-        
-        # Modelo para transcripción
         self.transcriber = WhisperModel("base", device="cuda", compute_type="float16")
-        
-        # Modelo para análisis de sentimiento (multilingüe)
-        self.sentiment_pipe = pipeline(
-            "sentiment-analysis", 
-            model="nlptown/bert-base-multilingual-uncased-sentiment",
-            device=0 # Usa la GPU
-        )
+        self.sentiment_pipe = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment", device=0)
 
     @modal.method()
     def process_call(self, filename: str, content: bytes):
-        print(f"--- Procesando llamada: {filename} ---")
-        
         temp_path = f"/tmp/{filename}"
         with open(temp_path, "wb") as f:
             f.write(content)
-
-        # A. Transcripción
+        
         segments, info = self.transcriber.transcribe(temp_path, beam_size=5)
         text = " ".join([segment.text for segment in segments])
+        sentiment = self.sentiment_pipe(text[:512])[0]
 
-        # B. Análisis de la llamada
-        # El modelo de sentimiento devuelve de 1 a 5 estrellas
-        sentiment_result = self.sentiment_pipe(text[:512])[0] # Analiza el inicio de la llamada
-        
-        # C. Resumen y Métricas
-        resultado = {
+        res = {
             "archivo": filename,
-            "fecha_proceso": datetime.now().isoformat(),
             "idioma": info.language,
-            "transcripcion": text,
-            "analisis": {
-                "puntuacion_sentimiento": sentiment_result['label'], # Ej: "1 star" (molesto) a "5 stars" (satisfecho)
-                "confianza_analisis": f"{sentiment_result['score']:.2f}",
-                "duracion_estimada_palabras": len(text.split()),
-                "alerta_calidad": "REVISAR" if "1 star" in sentiment_result['label'] else "NORMAL"
-            }
+            "sentimiento": sentiment['label'], # "1 star" a "5 stars"
+            "score": sentiment['score'],
+            "texto": text,
+            "palabras": len(text.split()),
+            "fecha": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
+        
+        # Guardar en volumen
+        with open(f"/data/{filename}_res.json", "w") as f:
+            json.dump(res, f)
+        return res
 
-        # D. Guardar en el Volumen
-        output_path = f"/data/{filename.replace('.', '_')}_analisis.json"
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(resultado, f, ensure_ascii=False, indent=4)
+# --- INTERFAZ WEB (STREAMLIT) ---
+@app.function(volumes={"/data": volume})
+@modal.wsgi_app()
+def ui():
+    import streamlit as st
+    import plotly.express as px
 
-        return resultado
+    st.set_page_config(page_title="Dashboard CallCenter AI", layout="wide")
+    st.title("📊 Análisis Masivo de Llamadas")
 
-@app.local_entrypoint()
-def main(folder_path: str):
-    import os
-    if not os.path.isdir(folder_path): return
+    # Sidebar: Cargar audios
+    with st.sidebar:
+        st.header("Cargar Audios")
+        uploaded_files = st.file_uploader("Sube archivos .mp3 o .wav", accept_multiple_files=True)
+        if st.button("🚀 Procesar Todo en Modal"):
+            if uploaded_files:
+                analyst = CallAnalyst()
+                payloads = [(f.name, f.read()) for f in uploaded_files]
+                with st.spinner("Procesando en paralelo con GPU..."):
+                    results = list(analyst.process_call.starmap(payloads))
+                st.success(f"¡{len(results)} llamadas procesadas!")
 
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith((".mp3", ".wav"))]
-    analyst = CallAnalyst()
+    # Cuerpo Principal: Dashboard
+    st.subheader("Historial de Análisis")
     
-    payloads = []
-    for f in files:
-        with open(os.path.join(folder_path, f), "rb") as audio:
-            payloads.append((f, audio.read()))
+    # Leer datos del volumen
+    data = []
+    for file in os.listdir("/data"):
+        if file.endswith(".json"):
+            with open(f"/data/{file}", "r") as f:
+                data.append(json.load(f))
 
-    results = list(analyst.process_call.starmap(payloads))
+    if data:
+        df = pd.DataFrame(data)
+        
+        # Métricas rápidas
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Llamadas", len(df))
+        col2.metric("Promedio Palabras", int(df["palabras"].mean()))
+        col3.metric("Idioma Principal", df["idioma"].mode()[0])
 
-    print("\n✅ ANALISIS MASIVO COMPLETADO")
-    for r in results:
-        status = "⚠️" if r['analisis']['alerta_calidad'] == "REVISAR" else "✅"
-        print(f"{status} Archivo: {r['archivo']} | Sentimiento: {r['analisis']['puntuacion_sentimiento']}")
+        # Gráfico de Sentimiento
+        fig = px.pie(df, names='sentimiento', title='Distribución de Satisfacción del Cliente')
+        st.plotly_chart(fig)
+
+        # Tabla de datos
+        st.dataframe(df[["fecha", "archivo", "idioma", "sentimiento", "palabras"]])
+    else:
+        st.info("Aún no hay datos. Sube audios en el panel de la izquierda.")
