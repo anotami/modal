@@ -3,101 +3,95 @@ import os
 import json
 from datetime import datetime
 
-# 1. Configuración del entorno en la nube
+# 1. Configuración del entorno (Añadimos librerías para el análisis)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "faster-whisper", 
         "torch", 
-        "torchaudio"
+        "torchaudio",
+        "transformers" # Para el análisis de texto
     )
-    .apt_install("ffmpeg") # Necesario para procesar audio
+    .apt_install("ffmpeg")
 )
 
-# Creamos o conectamos un volumen persistente para guardar resultados
 volume = modal.Volume.from_name("resultados-analisis-audio", create_if_missing=True)
+app = modal.App("transcriptor-analista-v1", image=image)
 
-app = modal.App("transcriptor-masivo-v1", image=image)
-
-# 2. Clase Procesadora con GPU
 @app.cls(
-    gpu="T4",               # GPU económica y eficiente para Whisper
+    gpu="T4", 
     container_idle_timeout=60, 
-    timeout=600,            # Tiempo máximo por audio (10 min)
     volumes={"/data": volume}
 )
-class AudioProcessor:
+class CallAnalyst:
     @modal.enter()
     def setup(self):
         from faster_whisper import WhisperModel
-        # Cargamos el modelo en la GPU (usamos 'base' para velocidad, 'medium' para precisión)
-        self.model = WhisperModel("base", device="cuda", compute_type="float16")
+        from transformers import pipeline
+        
+        # Modelo para transcripción
+        self.transcriber = WhisperModel("base", device="cuda", compute_type="float16")
+        
+        # Modelo para análisis de sentimiento (multilingüe)
+        self.sentiment_pipe = pipeline(
+            "sentiment-analysis", 
+            model="nlptown/bert-base-multilingual-uncased-sentiment",
+            device=0 # Usa la GPU
+        )
 
     @modal.method()
-    def process_audio(self, filename: str, content: bytes):
-        print(f"--- Procesando: {filename} ---")
+    def process_call(self, filename: str, content: bytes):
+        print(f"--- Procesando llamada: {filename} ---")
         
-        # Guardar temporalmente el audio en el contenedor para que Whisper lo lea
         temp_path = f"/tmp/{filename}"
         with open(temp_path, "wb") as f:
             f.write(content)
 
         # A. Transcripción
-        segments, info = self.model.transcribe(temp_path, beam_size=5)
+        segments, info = self.transcriber.transcribe(temp_path, beam_size=5)
         text = " ".join([segment.text for segment in segments])
 
-        # B. Análisis Básico (Aquí puedes integrar un LLM si lo deseas)
-        word_count = len(text.split())
+        # B. Análisis de la llamada
+        # El modelo de sentimiento devuelve de 1 a 5 estrellas
+        sentiment_result = self.sentiment_pipe(text[:512])[0] # Analiza el inicio de la llamada
         
+        # C. Resumen y Métricas
         resultado = {
             "archivo": filename,
-            "timestamp": datetime.now().isoformat(),
-            "idioma_detectado": info.language,
-            "probabilidad_idioma": info.language_probability,
-            "conteo_palabras": word_count,
-            "transcripcion": text
+            "fecha_proceso": datetime.now().isoformat(),
+            "idioma": info.language,
+            "transcripcion": text,
+            "analisis": {
+                "puntuacion_sentimiento": sentiment_result['label'], # Ej: "1 star" (molesto) a "5 stars" (satisfecho)
+                "confianza_analisis": f"{sentiment_result['score']:.2f}",
+                "duracion_estimada_palabras": len(text.split()),
+                "alerta_calidad": "REVISAR" if "1 star" in sentiment_result['label'] else "NORMAL"
+            }
         }
 
-        # C. Guardar en el Volumen Persistente de Modal
-        output_path = f"/data/{filename.replace('.', '_')}_res.json"
+        # D. Guardar en el Volumen
+        output_path = f"/data/{filename.replace('.', '_')}_analisis.json"
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(resultado, f, ensure_ascii=False, indent=4)
 
-        os.remove(temp_path) # Limpiar temporal
         return resultado
 
-# 3. Punto de entrada local (Ejecución desde tu PC)
 @app.local_entrypoint()
 def main(folder_path: str):
-    if not os.path.isdir(folder_path):
-        print(f"Error: La ruta '{folder_path}' no es una carpeta válida.")
-        return
+    import os
+    if not os.path.isdir(folder_path): return
 
-    # Listar audios locales
-    extensions = (".mp3", ".wav", ".m4a", ".ogg", ".flac")
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith(extensions)]
+    files = [f for f in os.listdir(folder_path) if f.lower().endswith((".mp3", ".wav"))]
+    analyst = CallAnalyst()
     
-    if not files:
-        print("No se encontraron archivos de audio.")
-        return
-
-    print(f"🚀 Iniciando procesamiento masivo de {len(files)} archivos...")
-    
-    processor = AudioProcessor()
-    
-    # Preparar datos para enviar a la nube
     payloads = []
     for f in files:
-        path = os.path.join(folder_path, f)
-        with open(path, "rb") as audio_file:
-            payloads.append((f, audio_file.read()))
+        with open(os.path.join(folder_path, f), "rb") as audio:
+            payloads.append((f, audio.read()))
 
-    # .starmap() ejecuta todo en paralelo en la infraestructura de Modal
-    # Si envías 100 audios, Modal levantará varias GPUs al mismo tiempo
-    results = list(processor.process_audio.starmap(payloads))
+    results = list(analyst.process_call.starmap(payloads))
 
-    print("\n✅ PROCESAMIENTO COMPLETADO")
+    print("\n✅ ANALISIS MASIVO COMPLETADO")
     for r in results:
-        print(f"- {r['archivo']}: {r['conteo_palabras']} palabras analizadas.")
-    
-    print("\n📂 Los resultados están guardados en el volumen 'resultados-analisis-audio' de Modal.")
+        status = "⚠️" if r['analisis']['alerta_calidad'] == "REVISAR" else "✅"
+        print(f"{status} Archivo: {r['archivo']} | Sentimiento: {r['analisis']['puntuacion_sentimiento']}")
